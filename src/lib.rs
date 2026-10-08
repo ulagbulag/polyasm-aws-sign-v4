@@ -1,20 +1,41 @@
-use chrono::{DateTime, Utc};
-use http::header::HeaderMap;
-use url::Url;
+#![no_std]
+
+extern crate alloc;
+#[cfg(feature = "std")]
+extern crate std;
+
+#[cfg(feature = "std")]
+use alloc::borrow::ToOwned;
+use alloc::{
+    format,
+    string::{String, ToString},
+    vec::Vec,
+};
+
+#[cfg(feature = "std")]
 use std::collections::HashMap;
-use sha256::{digest};
+
+#[cfg(feature = "url")]
+use hex::ToHex;
+#[cfg(feature = "std")]
+use http::header::HeaderMap;
+use jiff::{tz::TimeZone, Timestamp};
+use ring::digest;
+#[cfg(feature = "url")]
+use url::Url;
 
 const SHORT_DATE: &str = "%Y%m%d";
 const LONG_DATETIME: &str = "%Y%m%dT%H%M%SZ";
 
+#[cfg(feature = "url")]
 #[derive(Debug)]
 pub struct AwsSign<'a, T: 'a>
 where
-    &'a T: std::iter::IntoIterator<Item = (&'a String, &'a String)>,
+    &'a T: ::core::iter::IntoIterator<Item = (&'a String, &'a String)>,
 {
     method: &'a str,
     url: Url,
-    datetime: &'a DateTime<Utc>,
+    datetime: &'a Timestamp,
     region: &'a str,
     access_key: &'a str,
     secret_key: &'a str,
@@ -54,11 +75,16 @@ where
     body: &'a [u8],
 }
 
+#[cfg(feature = "std")]
 impl<'a> AwsSign<'a, HashMap<String, String>> {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "every field of one signature is one argument"
+    )]
     pub fn new<B: AsRef<[u8]> + ?Sized>(
         method: &'a str,
         url: &'a str,
-        datetime: &'a DateTime<Utc>,
+        datetime: &'a Timestamp,
         headers: &'a HeaderMap,
         region: &'a str,
         access_key: &'a str,
@@ -91,9 +117,10 @@ impl<'a> AwsSign<'a, HashMap<String, String>> {
     }
 }
 
+#[cfg(feature = "url")]
 impl<'a, T> AwsSign<'a, T>
 where
-    &'a T: std::iter::IntoIterator<Item = (&'a String, &'a String)>,
+    &'a T: ::core::iter::IntoIterator<Item = (&'a String, &'a String)>,
 {
     //Thanks https://github.com/durch/rust-s3 for the signing implementation.
 
@@ -118,7 +145,7 @@ where
     }
 
     pub fn canonical_request(&'a self) -> String {
-        let url: &str = self.url.path().into();
+        let url: &str = self.url.path();
 
         format!(
             "{method}\n{uri}\n{query_string}\n{headers}\n\n{signed}\n{sha256}",
@@ -127,25 +154,26 @@ where
             query_string = canonical_query_string(&self.url),
             headers = self.canonical_header_string(),
             signed = self.signed_header_string(),
-            sha256 = digest(self.body),
+            sha256 = digest::digest(&digest::SHA256, self.body).encode_hex::<String>(),
         )
     }
     pub fn sign(&'a self) -> String {
         let canonical = self.canonical_request();
         let string_to_sign = string_to_sign(self.datetime, self.region, &canonical, self.service);
-        let signing_key = signing_key(self.datetime, self.secret_key, self.region, self.service);
-        let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &signing_key.unwrap());
-        let tag = ring::hmac::sign(&key, string_to_sign.as_bytes());
-        let signature = hex::encode(tag.as_ref());
-        let signed_headers = self.signed_header_string();
-
-        format!(
-            "AWS4-HMAC-SHA256 Credential={access_key}/{scope},\
-             SignedHeaders={signed_headers},Signature={signature}",
-            access_key = self.access_key,
-            scope = scope_string(self.datetime, self.region, self.service),
-            signed_headers = signed_headers,
-            signature = signature
+        let signature = signature(
+            self.datetime,
+            self.secret_key,
+            self.region,
+            self.service,
+            &string_to_sign,
+        );
+        authorization(
+            self.access_key,
+            self.datetime,
+            self.region,
+            self.service,
+            &self.signed_header_string(),
+            &signature,
         )
     }
 }
@@ -170,6 +198,7 @@ pub fn uri_encode(string: &str, encode_slash: bool) -> String {
     result
 }
 
+#[cfg(feature = "url")]
 pub fn canonical_query_string(uri: &Url) -> String {
     let mut keyvalues = uri
         .query_pairs()
@@ -179,27 +208,32 @@ pub fn canonical_query_string(uri: &Url) -> String {
     keyvalues.join("&")
 }
 
-pub fn scope_string(datetime: &DateTime<Utc>, region: &str, service: &str) -> String {
+pub fn scope_string(datetime: &Timestamp, region: &str, service: &str) -> String {
     format!(
         "{date}/{region}/{service}/aws4_request",
-        date = datetime.format(SHORT_DATE),
+        date = datetime.to_zoned(TimeZone::UTC).strftime(SHORT_DATE),
         region = region,
         service = service
     )
 }
 
-pub fn string_to_sign(datetime: &DateTime<Utc>, region: &str, canonical_req: &str, service: &str) -> String {
-    let hash = ring::digest::digest(&ring::digest::SHA256, canonical_req.as_bytes());
+pub fn string_to_sign(
+    datetime: &Timestamp,
+    region: &str,
+    canonical_req: &str,
+    service: &str,
+) -> String {
+    let canonical_sha256 = digest::digest(&digest::SHA256, canonical_req.as_bytes());
     format!(
-        "AWS4-HMAC-SHA256\n{timestamp}\n{scope}\n{hash}",
-        timestamp = datetime.format(LONG_DATETIME),
+        "AWS4-HMAC-SHA256\n{timestamp}\n{scope}\n{canonical_sha256}",
+        timestamp = datetime.to_zoned(TimeZone::UTC).strftime(LONG_DATETIME),
         scope = scope_string(datetime, region, service),
-        hash = hex::encode(hash.as_ref())
+        canonical_sha256 = hex::encode(canonical_sha256.as_ref())
     )
 }
 
 pub fn signing_key(
-    datetime: &DateTime<Utc>,
+    datetime: &Timestamp,
     secret_key: &str,
     region: &str,
     service: &str,
@@ -209,7 +243,11 @@ pub fn signing_key(
     let date_key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, secret.as_bytes());
     let date_tag = ring::hmac::sign(
         &date_key,
-        datetime.format(SHORT_DATE).to_string().as_bytes(),
+        datetime
+            .to_zoned(TimeZone::UTC)
+            .strftime(SHORT_DATE)
+            .to_string()
+            .as_bytes(),
     );
 
     let region_key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, date_tag.as_ref());
@@ -223,14 +261,44 @@ pub fn signing_key(
     Ok(signing_tag.as_ref().to_vec())
 }
 
+/// Returns the hexadecimal signature of one string to sign under the
+/// signing key of `datetime`, `region` and `service`.
+pub fn signature(
+    datetime: &Timestamp,
+    secret_key: &str,
+    region: &str,
+    service: &str,
+    string_to_sign: &str,
+) -> String {
+    let signing_key = signing_key(datetime, secret_key, region, service);
+    let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &signing_key.unwrap());
+    let tag = ring::hmac::sign(&key, string_to_sign.as_bytes());
+    hex::encode(tag.as_ref())
+}
 
-#[cfg(test)]
+/// Returns the `authorization` header value of one signature.
+pub fn authorization(
+    access_key: &str,
+    datetime: &Timestamp,
+    region: &str,
+    service: &str,
+    signed_headers: &str,
+    signature: &str,
+) -> String {
+    format!(
+        "AWS4-HMAC-SHA256 Credential={access_key}/{scope},\
+         SignedHeaders={signed_headers},Signature={signature}",
+        scope = scope_string(datetime, region, service),
+    )
+}
+
+#[cfg(all(feature = "std", test))]
 mod tests {
     use super::*;
 
     #[test]
     fn sample_canonical_request() {
-        let datetime = chrono::Utc::now();
+        let datetime = jiff::Timestamp::now();
         let url: &str = "https://hi.s3.us-east-1.amazonaws.com/Prod/graphql";
         let map: HeaderMap = HeaderMap::new();
         let aws_sign = AwsSign::new(
@@ -250,7 +318,7 @@ mod tests {
 
     #[test]
     fn sample_canonical_request_using_u8_body() {
-        let datetime = chrono::Utc::now();
+        let datetime = jiff::Timestamp::now();
         let url: &str = "https://hi.s3.us-east-1.amazonaws.com/Prod/graphql";
         let map: HeaderMap = HeaderMap::new();
         let aws_sign = AwsSign::new(
@@ -270,7 +338,7 @@ mod tests {
 
     #[test]
     fn sample_canonical_request_using_vec_body() {
-        let datetime = chrono::Utc::now();
+        let datetime = jiff::Timestamp::now();
         let url: &str = "https://hi.s3.us-east-1.amazonaws.com/Prod/graphql";
         let map: HeaderMap = HeaderMap::new();
         let body = Vec::new();
